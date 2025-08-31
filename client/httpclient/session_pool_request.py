@@ -1,12 +1,16 @@
+import copy
+
 import requests
 import threading
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple, Optional
 from time import time, sleep
 from itertools import cycle
 
+from flask import g, has_app_context
 from requests import Response
 
-from common.logger.logger import get_logger
+from common.logger.logger import get_logger, info, warning
+from common.trace.trace import Trace, random_id, HEADER_TRACE_ID, HEADER_SPAN_ID, HEADER_PARENT_SPAN_ID
 
 logger = get_logger()
 
@@ -44,7 +48,7 @@ class SessionPoolHttpClient:
         return self._local.session
 
     def _request(self, method: str, url: str, data: Dict[str, Any] = None,
-                 params: Dict[str, Any] = None, headers: Dict[str, str] = None) -> Dict[str, Any]:
+                 params: Dict[str, Any] = None, headers: Dict[str, str] = None) -> Tuple[Dict[str, Any], Optional[Exception]]:
         attempt = 0
         session = self._get_session()
         merged_headers = {**self.default_headers, **(headers or {})}
@@ -57,8 +61,18 @@ class SessionPoolHttpClient:
             'rpc_final': False,
         }
         resp = Response()
+        trace = Trace()
+        # 只有在 Flask 上下文可用时才访问 g
+        if has_app_context():
+            trace = getattr(g, "trace", trace)
         while attempt <= self.retries:
+            cur_trace = copy.deepcopy(trace)
+            cur_trace.parent_span_id = random_id(16)
             log_dict['attempt'] = attempt
+
+            merged_headers[HEADER_TRACE_ID] = cur_trace.trace_id
+            merged_headers[HEADER_PARENT_SPAN_ID] = cur_trace.parent_span_id
+            merged_headers[HEADER_SPAN_ID] = cur_trace.span_id
             start_time = time()
             try:
                 resp = session.request(
@@ -77,52 +91,56 @@ class SessionPoolHttpClient:
                 log_dict['rpc_final'] = True
                 log_dict['proc_time'] = proc_time
                 log_dict['code'] = code
+                exception = None
                 try:
                     result = resp.json()
                     log_dict['response'] = result
-                    logger.info(log_dict)
+                    info('_com_http_success', log_dict, trace=cur_trace)
                 except Exception as e:
+                    exception = e
                     err = str(e)
                     code = 1000
                     result = resp.text
                     log_dict['response'] = result
                     log_dict['code'] = code
                     log_dict['err'] = err
-                    logger.warning(log_dict)
+                    warning('_com_http_failure', log_dict, trace=cur_trace)
                 return {
                     "response": result,
                     "code": code,
                     "err": err,
-                }
+                }, exception
             except requests.HTTPError as e:
+                exception = e
                 code = resp.status_code
                 err = str(e)
                 rpc_final = attempt >= self.retries
 
                 log_dict['rpc_final'] = rpc_final
-                logger.warning(log_dict)
+                warning('_com_http_failure', log_dict, trace=cur_trace)
                 if rpc_final:
-                    return {"code": code, "err": err}
+                    return {"code": code, "err": err}, exception
                 sleep(0.5)
                 attempt += 1
             except requests.RequestException as e:
+                exception = e
                 code = 1000
                 err = str(e)
                 rpc_final = attempt >= self.retries
                 log_dict['code'] = code
                 log_dict['err'] = err
                 log_dict['rpc_final'] = rpc_final
-                logger.warning(log_dict)
+                warning('_com_http_failure', log_dict, trace=cur_trace)
                 if rpc_final:
-                    return {"code": code, "err": err}
+                    return {"code": code, "err": err}, exception
                 sleep(0.5)
                 attempt += 1
 
-    def get(self, url: str, params: Dict[str, Any] = None, headers: Dict[str, str] = None) -> Dict[str, Any]:
+    def get(self, url: str, params: Dict[str, Any] = None, headers: Dict[str, str] = None) -> Tuple[Dict[str, Any], Optional[Exception]]:
         return self._request("GET", url, params=params, headers=headers)
 
-    def post(self, url: str, data: Dict[str, Any] = None, headers: Dict[str, str] = None) -> Dict[str, Any]:
-        return self._request("POST", url, data=data, headers=headers)
+    def post(self, url: str, data: Dict[str, Any] = None, headers: Dict[str, str] = None) -> Tuple[Dict[str, Any], Optional[Exception]]:
+        return self._request("POST", url, params=data, headers=headers)
 
 
 global_session_pool_http_client = SessionPoolHttpClient(10, 10, 3, {
